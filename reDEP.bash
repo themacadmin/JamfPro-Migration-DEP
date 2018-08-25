@@ -1,7 +1,8 @@
 #!/bin/bash
-# set -x 
+# set -x
 clear
-
+[ $EUID != 0 ] && echo "This script requires root privileges, please run \"sudo $0\"" && exit 1
+[ $(sw_vers | awk -F "." '/ProductVersion:/ { print $2 }') != 13 ] && echo "Halting migration. Prerequisites not met. Migration prerequisites include a minimum OS version of macOS High Sierra v10.13" && exit 1
 
 # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # #
 #
@@ -41,19 +42,16 @@ clear
 # This locks User-Approved MDM in place, with minimal user interaction.
 #
 # To accomplish this the following will be performed:
-#       - Record pre-migration state data at /Library/$myOrg/Data/com.$myOrg.jamfLocalExtensionAttributes.plist
-#         - Exit with error if FileVault operations are in progress or FileVault state cannot be determined
-#       - Remove old MDM profile
-#         - Attempt MDM profile removal via Jamf binary
-#         - Attempt MDM profile removal via Jamf API sending an MDM UnmanageDevice command
-#         - Lastly, if failed to remove MDM Profile the /var/db/ConfigurationProfiles folder will be renamed.
-#        -Enroll to new Jamf Pro instance
-#         - Enroll to new Jamf Pro via invitation
-#         - Call DEP nag
-#       - Compensate for Jamf PI-005441 (causes computer to become unmanaged after issuing DEP nag)
-#         - Pause to allow user to accept DEP enrollment
-#         - Set correct values for remote_management fields via Jamf API
-#         - Reassert management framework and continue enrollment policies
+#           - Record pre-migration state data at /Library/$myOrg/Data/com.$myOrg.jamfLocalExtensionAttributes.plist
+#				- Exit with error if FileVault operations are in progress or FileVault state cannot be determined
+#			- Attempt MDM profile removal via Jamf binary
+#           - Attempt MDM profile removal via Jamf API sending an MDM UnmanageDevice command
+#           - Lastly, if failed to remove MDM Profile the /var/db/ConfigurationProfiles
+#             folder will be renamed.
+#           - Compensate for Jamf PI-005441
+#				- Pause to allow user to accept DEP enrollment
+#				- Set correct values for remote_management fields via Jamf API
+#				- Reassert management framework and continue enrollment policies
 #
 # REQUIREMENTS:
 #       - One Jamf Pro URL to read original data from:
@@ -76,6 +74,8 @@ clear
 # Aditional DEP worklow added on by Doug Worley and Miles Leacy - 22nd February 2018
 # Doug Worley - Senior PSE, Jamf
 # Miles Leacy - Technical Expert, Apple Technology, Walmart
+#
+# Reboot and re-run setup assistant added by Miles Leacy - 20th August 2018
 # 
 # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # #
 
@@ -83,36 +83,54 @@ clear
 # USER VARIABLES - These can be left blank here and populated by Jamf policy parameters
 # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # #
 
-oldJamfProURL=""				    # Old Jamf Pro server URL - for API (ie. https://jamfold.acme.com:8443)
-	oldJamfApiUser=""			    # API user account in Jamf Pro w/ Update permission
-	oldJamfApiPass=""			    # Password for above API user account
+oldJamfPro=""			# Multiple values are stored in this variable,
+						# Old Jamf Pro server URL, API username, and API password,
+						# separated by ? characters.
+						# i.e., https://jamfold.acme.com:8443?apiusername?apipassword
 
-newJamfProURL=""				    # New Jamf Pro server URL - for enrolling (ie. https://jamfnew.acme.com:8443)
-	newJamfInvitationCode=""	# Re-usable invitation code from Recon.app or SMTP invitation
+newJamfPro=""			# Multiple values are stored in this variable,
+						# Old Jamf Pro server URL, API username, and API password,
+						# enrollment invitation ID, management account, separated by ? characters.
+						# i.e., https://jamfnew.acme.com:8443?apiusername?apipassword?1234567890?managementaccount
 
-myOrg=""		                # Used to generate path and filename for
-								            # /Library/$myOrg/Data/com.$myOrg.jamfLocalExtensionAttributes.plist
+myOrg=""				# Used to generate path and filename for
+						# /Library/$myOrg/Data/com.$myOrg.jamfLocalExtensionAttributes.plist
+								
+internalServiceHandler=""		# SRV record address to validate that computer is on internal network (optional, required if org's management processes require internal resources)
+
+dryRun=""				# Must be non-null for the script to run without user intervention.
 
 # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # #
 # Jamf policy parameters
 # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # #
 
-[ "$4" != "" ] && [ "$oldJamfProURL" == "" ] && oldJamfProURL=$4
-[ "$5" != "" ] && [ "$oldJamfApiUser" == "" ] && oldJamfApiUser=$5
-[ "$6" != "" ] && [ "$oldJamfApiPass" == "" ] && oldJamfApiPass=$6
-[ "$7" != "" ] && [ "$newJamfProURL" == "" ] && newJamfProURL=$7
-[ "$8" != "" ] && [ "$newJamfInvitationCode" == "" ] && newJamfInvitationCode=$8
-# Parameter 9 is used to populate the "real" Jamf SSH/management username in $managementUser for the second execution of the createXml function
-# Parameter 10 is used to populate the "real" Jamf SSH/management password in $managementPass for the second execution of the createXml function
-  # NOTE: Parameter 9 & 10 values should match the management account used by user initiated enrollment in the new Jamf Pro
-[ "${11}" != "" ] && [ "$myOrg" == "" ] && myOrg=${11}
+[ "$4" != "" ] && [ "$oldJamfPro" == "" ] && oldJamfPro=$4
+[ "$5" != "" ] && [ "$newJamfPro" == "" ] && newJamfPro=$5
+[ "$6" != "" ] && [ "$myOrg" == "" ] && myOrg=$6
+[ "$7" != "" ] && [ "$internalServiceHandler" == "" ] && internalServiceHandler=$7
+[ "$8" != "" ] && [ "$dryRun" == "" ] && dryRun=$8
+
+# # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # #
+# Parsing Jamf policy parameters
+# # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # #
+
+oldJamfProURL=$(awk -F "?" '{print $1}' <<< "$oldJamfPro")
+oldJamfApiUser=$(awk -F "?" '{print $2}' <<< "$oldJamfPro")
+oldJamfApiPass=$(awk -F "?" '{print $3}' <<< "$oldJamfPro")
+
+newJamfProURL=$(awk -F "?" '{print $1}' <<< "$newJamfPro")
+newJamfApiUser=$(awk -F "?" '{print $2}' <<< "$newJamfPro")
+newJamfApiPass=$(awk -F "?" '{print $3}' <<< "$newJamfPro")
+newJamfInvitationCode=$(awk -F "?" '{print $4}' <<< "$newJamfPro")
+newJamfManagementAccount=$(awk -F "?" '{print $5}' <<< "$newJamfPro")
 
 # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # #
 # SYSTEM VARIABLES
 # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # #
 
+currentUser=$(stat -f %Su /dev/console)
 osMinorVersion=$( /usr/bin/sw_vers -productVersion | /usr/bin/cut -d. -f2 )
-timestamp=$( /bin/date '+%Y-%m-%d-%H-%M-%S' )
+timeStamp=$(date +"%F %T")
 mySerial=$( system_profiler SPHardwareDataType | grep Serial |  awk '{print $NF}' )
 jamfProCompID=$( /usr/bin/curl -s -u ${oldJamfApiUser}:${oldJamfApiPass} ${oldJamfProURL}/JSSResource/computers/serialnumber/${mySerial}/subset/general 2>/dev/null | /usr/bin/xpath "//computer/general/id/text()" 2>/dev/null)
 macMgmtUser=$(/usr/bin/curl -sk -H "Accept: application/xml" ${oldJamfProURL}/JSSResource/computers/serialnumber/${mySerial} -u ${oldJamfApiUser}:${oldJamfApiPass} | tidy -xml 2>/dev/null | xpath "//general/remote_management/management_username/text()" 2>/dev/null)
@@ -128,6 +146,35 @@ Cancelling this attempt.
 If FileVault is encrypting or decrypting, please retry migration after FileVault operations are complete.
 
 If FileVault is idle, please contact support."
+
+# # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # #
+# VARIABLES CHECKS
+# # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # #
+
+if [ -z "$dryRun" ]; then
+	printf "$timeStamp %s\n" "The following values will be used for migration. Please verify."
+	printf "$timeStamp %s\n" "Organization: $myOrg"
+	printf "$timeStamp %s\n" "Old Jamf Pro Server Info"	
+	printf "$timeStamp %s\n" "Old Jamf Pro URL:  $oldJamfProURL"
+	printf "$timeStamp %s\n" "Old Jamf Pro API User:  $oldJamfApiUser"
+	printf "$timeStamp %s\n" "Old Jamf Pro API Pass:  $oldJamfApiPass"
+	printf "$timeStamp %s\n" "New Jamf Pro Server Info"
+	printf "$timeStamp %s\n" "New Jamf Pro URL:  $newJamfProURL"
+	printf "$timeStamp %s\n" "New Jamf Pro API User:  $newJamfApiUser"
+	printf "$timeStamp %s\n" "New Jamf Pro API Pass:  $newJamfApiPass"
+	printf "$timeStamp %s\n" "New Jamf Pro Invitation:  $newJamfInvitationCode"
+	printf "$timeStamp %s\n" "New Jamf Pro Management Account:  $newJamfManagementAccount"
+	read -r -p "Are you sure? [y/N] " response
+	case "$response" in
+    	[yY][eE][sS]|[yY]) 
+			printf "$timeStamp %s\n" "Continuing with migration."
+			;;
+		*)
+			printf "$timeStamp %s\n" "Halting migration."	
+			exit 1
+			;;
+	esac
+fi
 
 # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # #
 # FUNCTIONS
@@ -168,6 +215,7 @@ enrollToNewJamf() {
             echo " Successfully created plist for new JSS!"
         else
             echo " ALERT - There was a problem with creating plist for the new JSS."
+			exit 99
         fi
 
     echo " Enrolling to new Jamf Pro... this might take some time ..."
@@ -177,15 +225,12 @@ enrollToNewJamf() {
             echo "$(defaults read /Library/Preferences/com.jamfsoftware.jamf.plist jss_url)"
         else
             echo " ALERT - There was a problem with enrolling to the new JSS."
+			exit 99
         fi
 
-    echo " Attempting to lock MDM in place with DEP."
-    profiles -N
-        if [ "$?" != "" ]; then
-            echo " DEP Successful!"
-        else
-            echo " ALERT - There was a problem with enrolling with DEP."
-        fi
+    echo " Rebooting into Setup Assistant for DEP enrollment."
+    rm -rf /var/db/.AppleSetUpDone
+	/sbin/shutdown -r now
 }
 
 
@@ -216,6 +261,11 @@ putXmlApi() {
         curl -sk -u $oldJamfApiUser:$oldJamfApiPass $oldJamfProURL/JSSResource/computers/serialnumber/"${mySerial}"/subset/general -T $xmlPath -X PUT
         displayMacMgmtUser
 }
+
+putXmlApiNew() {
+        curl -sk -u $newJamfApiUser:$newJamfApiPass $newJamfProURL/JSSResource/computers/serialnumber/"${mySerial}"/subset/general -T $xmlPath -X PUT
+        displayMacMgmtUser
+	}
 
 removeMDMandEnroll() {
     echo " Removing MDM Profiles ..."
@@ -269,6 +319,21 @@ removeMDMandEnroll() {
 # Main Application
 # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # #
 
+##### Preflight #####
+
+# Grant admin to console user
+# Admin is required to receive DEP notification
+dscl . -append /groups/admin GroupMembership "$currentUser"
+printf "$timeStamp %s\n" "Admin privileges granted to $currentUser"
+
+# Determine if on internal network
+# comment out this section if internal resourecs are not required for migration
+host -t SRV "$internalServiceHandler" > /dev/null
+if [ $? -ne 0 ]; then
+	printf "$timeStamp %s\n" "Internal network not detected." "Halting migration."
+	exit 1
+fi
+
 ##### Capture migration details #####
 
 # Create plist directory if needed
@@ -297,7 +362,7 @@ echo " Clearing previous local Jamf migration records."
 echo " Recording local Jamf migration data."
 /usr/libexec/PlistBuddy -c "Add :JamfMigration:wasMigrated bool true" "$localDataPath"/"$localDataPlist"
 /usr/libexec/PlistBuddy -c "Add :JamfMigration:oldJSS string $oldJamfProURL" "$localDataPath"/"$localDataPlist"
-/usr/libexec/PlistBuddy -c "Add :JamfMigration:usernameAtMigration string $(stat -f %Su /dev/console)" "$localDataPath"/"$localDataPlist"
+/usr/libexec/PlistBuddy -c "Add :JamfMigration:usernameAtMigration string $currentUser" "$localDataPath"/"$localDataPlist"
 /usr/libexec/PlistBuddy -c "Add :JamfMigration:fileVaultedByOldOrg bool $preMigrationFileVaultStatus" "$localDataPath"/"$localDataPlist"
 
 ##### Migration #####
@@ -312,27 +377,5 @@ else
     echo " Mac has local management account: '$macMgmtUser' - continuing..."
     removeMDMandEnroll
 fi
-
-##### Compensate for Jamf PI-005441 #####
-
-# pause to allow user to accept DEP enrollment
-sleep 30
-
-# set correct values for management account credentials
-managementUser=$9
-managementPass="${10}" # note: curly braces required for 2-digit parameters
-
-# Set computer as managed in Jamf Pro
-createXml
-    cat "$xmlPath"
-putXmlApi
-
-# Reassert management framework and continue enrollment policies
-/usr/local/bin/jamf manage
-/usr/local/bin/jamf policy -event enrollmentComplete
-
-# # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # #
-# CLEANUP & EXIT
-# # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # #
 
 exit 0
