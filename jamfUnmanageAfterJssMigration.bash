@@ -36,11 +36,14 @@ reset
 	# Full URL and credentials to the Old JSS. 
 		oldApiUser=""
 		oldApiPass=""
+		
+internalServiceHandler=""		# SRV record address to validate that computer is on internal network (optional, required if org's old Jamf Pro instance is not Internet-facing.)
 
 # read parameters
 	[ "$4" != "" ] && [ "$oldJamfUrl" == "" ] && oldJamfUrl=$4
 	[ "$5" != "" ] && [ "$oldApiUser" == "" ] && oldApiUser=$5
 	[ "$6" != "" ] && [ "$oldApiPass" == "" ] && oldApiPass=$6
+	[ "$7" != "" ] && [ "$internalServiceHandler" == "" ] && internalServiceHandler=$7
 
 # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # #
 # SYSTEM VARIABLES
@@ -85,9 +88,19 @@ putXmlApiToOldJamf() {
 # Main Application
 # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # #
 
-	printf "$timeStamp %s\n" "Marking $macSerial "unmanaged" in $oldJamfUrl"
-	createXml
-	putXmlApiToOldJamf
-	rm $xmlPath
-	
+if [ -n "$internalServiceHandler" ]; then
+	host -t SRV "$internalServiceHandler" > /dev/null
+	if [ $? -ne 0 ]; then
+		printf "$timeStamp %s\n" "Internal network not detected."
+		printf "$timeStamp %s\n" "Cannot access old Jamf Pro."
+		printf "$timeStamp %s\n" "Exiting."
+		exit 1
+	fi
+fi
+
+printf "$timeStamp %s\n" "Marking $macSerial "unmanaged" in $oldJamfUrl"
+createXml
+putXmlApiToOldJamf
+rm $xmlPath
+
 exit 0
