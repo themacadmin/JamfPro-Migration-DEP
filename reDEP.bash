@@ -48,10 +48,6 @@ clear
 #           - Attempt MDM profile removal via Jamf API sending an MDM UnmanageDevice command
 #           - Lastly, if failed to remove MDM Profile the /var/db/ConfigurationProfiles
 #             folder will be renamed.
-#           - Compensate for Jamf PI-005441
-#				- Pause to allow user to accept DEP enrollment
-#				- Set correct values for remote_management fields via Jamf API
-#				- Reassert management framework and continue enrollment policies
 #
 # REQUIREMENTS:
 #       - One Jamf Pro URL to read original data from:
@@ -100,6 +96,8 @@ internalServiceHandler=""		# SRV record address to validate that computer is on 
 
 dryRun=""				# Must be non-null for the script to run without user intervention.
 
+assignToSameUser=""		# Must be non-null for the script to retain the Mac's user assignment from the old Jamf instance in the new Jamf instance
+
 # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # #
 # Jamf policy parameters
 # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # #
@@ -109,6 +107,7 @@ dryRun=""				# Must be non-null for the script to run without user intervention.
 [ "$6" != "" ] && [ "$myOrg" == "" ] && myOrg=$6
 [ "$7" != "" ] && [ "$internalServiceHandler" == "" ] && internalServiceHandler=$7
 [ "$8" != "" ] && [ "$dryRun" == "" ] && dryRun=$8
+[ "$9" != "" ] && [ "$assignToSameUser" == "" ] && assignToSameUser=$9
 
 # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # #
 # Parsing Jamf policy parameters
@@ -132,8 +131,10 @@ currentUser=$(stat -f %Su /dev/console)
 osMinorVersion=$( /usr/bin/sw_vers -productVersion | /usr/bin/cut -d. -f2 )
 timeStamp=$(date +"%F %T")
 mySerial=$( system_profiler SPHardwareDataType | grep Serial |  awk '{print $NF}' )
-jamfProCompID=$( /usr/bin/curl -s -u ${oldJamfApiUser}:${oldJamfApiPass} ${oldJamfProURL}/JSSResource/computers/serialnumber/${mySerial}/subset/general 2>/dev/null | /usr/bin/xpath "//computer/general/id/text()" 2>/dev/null)
-macMgmtUser=$(/usr/bin/curl -sk -H "Accept: application/xml" ${oldJamfProURL}/JSSResource/computers/serialnumber/${mySerial} -u ${oldJamfApiUser}:${oldJamfApiPass} | tidy -xml 2>/dev/null | xpath "//general/remote_management/management_username/text()" 2>/dev/null)
+computerRecordOldJamf=$( /usr/bin/curl -s -u ${oldJamfApiUser}:${oldJamfApiPass} ${oldJamfProURL}/JSSResource/computers/serialnumber/${mySerial}/subset/general 2>/dev/null)
+	oldJamfAssignedUser=$(echo $computerRecordOldJamf | /usr/bin/xpath "//computer/location/username/text()" 2>/dev/null)
+	oldJamfCompID=$(echo $computerRecordOldJamf | /usr/bin/xpath "//computer/general/id/text()" 2>/dev/null)
+	macMgmtUser=$(echo $computerRecordOldJamf | xpath "//general/remote_management/management_username/text()" 2>/dev/null)
 xmlPath="/tmp/tmp.xml"
 managementUser="filler"
 managementPass="filler"
@@ -146,6 +147,12 @@ Cancelling this attempt.
 If FileVault is encrypting or decrypting, please retry migration after FileVault operations are complete.
 
 If FileVault is idle, please contact support."
+
+# Create localDataPath directory if needed
+if [ ! -d "$localDataPath" ]; then
+  printf "$timeStamp %s\n" " Creating local data path."
+  mkdir -p "$localDataPath"
+fi
 
 # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # #
 # VARIABLES CHECKS
@@ -183,23 +190,23 @@ fi
 checkMDMProfileInstalled() {
     enrolled=$(/usr/bin/profiles -C | /usr/bin/grep "00000000-0000-0000-A000-4A414D460003")
     if [ "$enrolled" != "" ]; then
-        printf "$timeStamp %s\n" " MDM Profile Present..."
+        printf "$timeStamp %s\n" " MDM Profile Present..." | tee "$localDataPath"/migrationLog.txt
         mdmPresent=1
     else
-        printf "$timeStamp %s\n" " MDM Profile Successfully Removed..."
+        printf "$timeStamp %s\n" " MDM Profile Successfully Removed..." | tee "$localDataPath"/migrationLog.txt
         mdmPresent=0
     fi
 }
 
 
 jamfUnmanageDeviceAPI() {
-    /usr/bin/curl -s -X POST -H "Content-Type: text/xml" -u ${oldJamfApiUser}:${oldJamfApiPass} ${oldJamfProURL}/JSSResource/computercommands/command/UnmanageDevice/id/${jamfProCompID} 2>/dev/null
+    /usr/bin/curl -s -X POST -H "Content-Type: text/xml" -u ${oldJamfApiUser}:${oldJamfApiPass} ${oldJamfProURL}/JSSResource/computercommands/command/UnmanageDevice/id/${oldJamfCompID} 2>/dev/null
     sleep 10
     checkMDMProfileInstalled
     counter=0
     until [ "$mdmPresent" -eq "0" ] || [ "$counter" -gt "9" ]; do
         ((counter++))
-        printf "$timeStamp %s\n" " Check ${counter}/10; MDM Profile Present; waiting 30 seconds to re-check..."
+        printf "$timeStamp %s\n" " Check ${counter}/10; MDM Profile Present; waiting 30 seconds to re-check..." | tee "$localDataPath"/migrationLog.txt
         sleep 30
         checkMDMProfileInstalled
     done
@@ -208,35 +215,39 @@ jamfUnmanageDeviceAPI() {
 
 
 enrollToNewJamf() {
-    printf "$timeStamp %s\n" " Enrolling with new Jamf..."
-    printf "$timeStamp %s\n" " Creating plist for new JSS..."
+    printf "$timeStamp %s\n" " Enrolling with new Jamf..." | tee "$localDataPath"/migrationLog.txt
+    printf "$timeStamp %s\n" " Creating plist for new JSS..." | tee "$localDataPath"/migrationLog.txt
     jamf createConf -url "$newJamfProURL"  
         if [ "$?" != "" ]; then
-            printf "$timeStamp %s\n" " Successfully created plist for new JSS!"
+            printf "$timeStamp %s\n" " Successfully created plist for new JSS!" | tee "$localDataPath"/migrationLog.txt
         else
-            printf "$timeStamp %s\n" " ALERT - There was a problem with creating plist for the new JSS."
+            printf "$timeStamp %s\n" " ALERT - There was a problem with creating plist for the new JSS." | tee "$localDataPath"/migrationLog.txt
 			exit 99
         fi
 
-    printf "$timeStamp %s\n" " Enrolling to new Jamf Pro... this might take some time ..."
+    printf "$timeStamp %s\n" " Enrolling to new Jamf Pro... this might take some time ..." | tee "$localDataPath"/migrationLog.txt
     jamf enroll -invitation "$newJamfInvitationCode"
         if [ "$?" != "" ]; then
-            printf "$timeStamp %s\n" " Successfully migrated to new Jamf Pro."
-            printf "$timeStamp %s\n" "$(defaults read /Library/Preferences/com.jamfsoftware.jamf.plist jss_url)"
+            printf "$timeStamp %s\n" " Successfully migrated to new Jamf Pro." | tee "$localDataPath"/migrationLog.txt
+            printf "$timeStamp %s\n" "$(defaults read /Library/Preferences/com.jamfsoftware.jamf.plist jss_url)" | tee "$localDataPath"/migrationLog.txt
+			if [ -n "$assignToSameUser" ]; then
+				if [ -n "$oldJamfAssignedUser" ]; then
+					jamf recon -endUsername "$oldJamfAssignedUser"
+				fi
+			fi
         else
-            printf "$timeStamp %s\n" " ALERT - There was a problem with enrolling to the new JSS."
+            printf "$timeStamp %s\n" " ALERT - There was a problem with enrolling to the new JSS." | tee "$localDataPath"/migrationLog.txt
 			exit 99
         fi
 
-    printf "$timeStamp %s\n" " Rebooting into Setup Assistant for DEP enrollment."
+    printf "$timeStamp %s\n" "Configuring Mac to run Setup Assistant at next startup for DEP enrollment." | tee "$localDataPath"/migrationLog.txt
     rm -rf /var/db/.AppleSetUpDone
-	/sbin/shutdown -r now
 }
 
 
 displayMacMgmtUser(){
     macMgmtUser=$(/usr/bin/curl -sk -H "Accept: application/xml" ${oldJamfProURL}/JSSResource/computers/serialnumber/${mySerial} -u ${oldJamfApiUser}:${oldJamfApiPass} | tidy -xml 2>/dev/null | xpath "//general/remote_management/management_username/text()" 2>/dev/null)
-    printf "$timeStamp %s\n" " macMgmtUser is: $macMgmtUser"
+    printf "$timeStamp %s\n" " macMgmtUser is: $macMgmtUser" | tee "$localDataPath"/migrationLog.txt
 }
 
 createXml() {
@@ -267,46 +278,46 @@ putXmlApiNew() {
 	}
 
 removeMDMandEnroll() {
-    printf "$timeStamp %s\n" " Removing MDM Profiles ..."
+    printf "$timeStamp %s\n" " Removing MDM Profiles ..." | tee "$localDataPath"/migrationLog.txt
     if [ "${osMinorVersion}" -ge 13 ]; then
-        printf "$timeStamp %s\n" " macOS $(/usr/bin/sw_vers -productVersion); attempting removal via jamf binary..."
+        printf "$timeStamp %s\n" " macOS $(/usr/bin/sw_vers -productVersion); attempting removal via jamf binary..." | tee "$localDataPath"/migrationLog.txt
         /usr/local/bin/jamf removeMdmProfile -verbose
         sleep 3
         checkMDMProfileInstalled
         if [ "$mdmPresent" == "0" ]; then
-            printf "$timeStamp %s\n" " Successfully Removed MDM Profile..."
+            printf "$timeStamp %s\n" " Successfully Removed MDM Profile..." | tee "$localDataPath"/migrationLog.txt
             enrollToNewJamf
         else
-            printf "$timeStamp %s\n" " MDM Profile Present; attempting removal via API..."
+            printf "$timeStamp %s\n" " MDM Profile Present; attempting removal via API..." | tee "$localDataPath"/migrationLog.txt
             jamfUnmanageDeviceAPI
             if [ "$mdmPresent" != "0" ]; then
-                printf "$timeStamp %s\n" " Unable to remove MDM Profile; exiting..."
+                printf "$timeStamp %s\n" " Unable to remove MDM Profile; exiting..." | tee "$localDataPath"/migrationLog.txt
                 exit 1
             elif [ "$mdmPresent" == "0" ]; then
-                printf "$timeStamp %s\n" " Successfully Removed MDM Profile..."
+                printf "$timeStamp %s\n" " Successfully Removed MDM Profile..." | tee "$localDataPath"/migrationLog.txt
                 enrollToNewJamf
             fi
         fi
     else
-        printf "$timeStamp %s\n" "macOS $(/usr/bin/sw_vers -productVersion); attempting removal via jamf binary..."
+        printf "$timeStamp %s\n" "macOS $(/usr/bin/sw_vers -productVersion); attempting removal via jamf binary..." | tee "$localDataPath"/migrationLog.txt
         /usr/local/bin/jamf removeMdmProfile -verbose
         sleep 3
         checkMDMProfileInstalled
         if [ "$mdmPresent" == "0" ]; then
-            printf "$timeStamp %s\n" " Successfully Removed MDM Profile..."
+            printf "$timeStamp %s\n" " Successfully Removed MDM Profile..." | tee "$localDataPath"/migrationLog.txt
             enrollToNewJamf
         else
-            printf "$timeStamp %s\n" " MDM Profile Present; attempting removal via API..."
+            printf "$timeStamp %s\n" " MDM Profile Present; attempting removal via API..." | tee "$localDataPath"/migrationLog.txt
             jamfUnmanageDeviceAPI
             if [ "$mdmPresent" == "0" ]; then
-                printf "$timeStamp %s\n" " Successfully Removed MDM Profile..."
+                printf "$timeStamp %s\n" " Successfully Removed MDM Profile..." | tee "$localDataPath"/migrationLog.txt
                 enrollToNewJamf
             else
-                printf "$timeStamp %s\n" " macOS $(/usr/bin/sw_vers -productVersion); attempting force removal..."
+                printf "$timeStamp %s\n" " macOS $(/usr/bin/sw_vers -productVersion); attempting force removal..." | tee "$localDataPath"/migrationLog.txt
                 /bin/mv -v /var/db/ConfigurationProfiles/ /var/db/ConfigurationProfiles-$timestamp
                 checkMDMProfileInstalled
                 if [ "$mdmPresent" != "0" ]; then
-                    printf "$timeStamp %s\n" " Unable to remove MDM Profile; exiting..."
+                    printf "$timeStamp %s\n" " Unable to remove MDM Profile; exiting..." | tee "$localDataPath"/migrationLog.txt
                     exit 1
                 fi
             fi
@@ -323,13 +334,13 @@ removeMDMandEnroll() {
 # Grant admin to console user
 # Admin is required to receive DEP notification
 dscl . -append /groups/admin GroupMembership "$currentUser"
-printf "$timeStamp %s\n" "Admin privileges granted to $currentUser"
+printf "$timeStamp %s\n" "Admin privileges granted to $currentUser" | tee "$localDataPath"/migrationLog.txt
 
 # Determine if on internal network
 # comment out this section if internal resourecs are not required for migration
 host -t SRV "$internalServiceHandler" > /dev/null
 if [ $? -ne 0 ]; then
-	printf "$timeStamp %s\n" "Internal network not detected." "Halting migration."
+	printf "$timeStamp %s\n" "Internal network not detected." "Halting migration." | tee "$localDataPath"/migrationLog.txt
 	exit 1
 fi
 
@@ -337,7 +348,7 @@ fi
 
 # Create plist directory if needed
 if [ ! -d "$localDataPath" ]; then
-  printf "$timeStamp %s\n" " Creating local data path."
+  printf "$timeStamp %s\n" " Creating local data path." | tee "$localDataPath"/migrationLog.txt
   mkdir -p "$localDataPath"
 fi
 
@@ -348,17 +359,17 @@ if [ "$fdeState" = "FileVault is Off." ]; then
 elif [ "$fdeState" = "FileVault is On." ]; then
     preMigrationFileVaultStatus="true"
 else
-    printf "$timeStamp %s\n" " FileVault operations in progress or in an unknown state."
+    printf "$timeStamp %s\n" " FileVault operations in progress or in an unknown state." | tee "$localDataPath"/migrationLog.txt
     osascript -e 'Tell application "System Events" to display alert "'"$fileVaultStatusErrorMessage"'" as warning'
     exit 1
 fi
 
 # Clear JamfMigration array
-printf "$timeStamp %s\n" " Clearing previous local Jamf migration records."
+printf "$timeStamp %s\n" " Clearing previous local Jamf migration records." | tee "$localDataPath"/migrationLog.txt
 /usr/libexec/PlistBuddy -c "Delete :JamfMigration" "$localDataPath"/"$localDataPlist"
 
 # Record Migration Data
-printf "$timeStamp %s\n" " Recording local Jamf migration data."
+printf "$timeStamp %s\n" " Recording local Jamf migration data." | tee "$localDataPath"/migrationLog.txt
 /usr/libexec/PlistBuddy -c "Add :JamfMigration:wasMigrated bool true" "$localDataPath"/"$localDataPlist"
 /usr/libexec/PlistBuddy -c "Add :JamfMigration:oldJSS string $oldJamfProURL" "$localDataPath"/"$localDataPlist"
 /usr/libexec/PlistBuddy -c "Add :JamfMigration:usernameAtMigration string $currentUser" "$localDataPath"/"$localDataPlist"
@@ -367,14 +378,16 @@ printf "$timeStamp %s\n" " Recording local Jamf migration data."
 ##### Migration #####
 displayMacMgmtUser
 if [ "$macMgmtUser" == "" ]; then
-    printf "$timeStamp %s\n" " Mac is marked as 'unmanaged' - filling with dummy data..."
+    printf "$timeStamp %s\n" " Mac is marked as 'unmanaged' - filling with dummy data..." | tee "$localDataPath"/migrationLog.txt
     createXml
         cat "$xmlPath"
     putXmlApi
     removeMDMandEnroll
 else
-    printf "$timeStamp %s\n" " Mac has local management account: '$macMgmtUser' - continuing..."
+    printf "$timeStamp %s\n" " Mac has local management account: '$macMgmtUser' - continuing..." | tee "$localDataPath"/migrationLog.txt
     removeMDMandEnroll
 fi
+
+printf "$timeStamp %s\n" "This Mac should restart shortly." | tee "$localDataPath"/migrationLog.txt
 
 exit 0
