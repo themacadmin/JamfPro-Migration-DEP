@@ -106,7 +106,7 @@ putXmlApiToOldJamf() {
 		printf "$timeStamp %s\n" "An API error occurred."
 		printf "$timeStamp %s\n" "Exiting."
 		exit 2
-	elif [[ $xmlPutResponse == *"oldJssId"* ]]; then
+	elif [[ $xmlPutResponse == *"$oldJssId"* ]]; then
 		printf "$timeStamp %s\n" "$macSerial is marked unmanaged in $oldJamfUrl"
 	else
 		printf "$timeStamp %s\n" "An unknown error occurred."
