@@ -57,6 +57,12 @@ macSerial=$( system_profiler SPHardwareDataType | grep Serial |  awk '{print $NF
 # FUNCTIONS
 # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # #
 
+getOldJamfData() {
+	computerRecordOldJamf=$( /usr/bin/curl -s -u ${oldApiUser}:${oldApiPass} ${oldJamfUrl}/JSSResource/computers/serialnumber/${macSerial}/subset/general 2>/dev/null)
+	oldJssId=$(echo $computerRecordOldJamf | /usr/bin/xpath "//computer/general/id/text()" 2>/dev/null)
+	oldRemoteManagement=$(echo $computerRecordOldJamf | /usr/bin/xpath "//computer/general/remote_management/managed/text()" 2>/dev/null)
+}
+
 createXml() {
 # echo "generating XML..."
 cat <<EndXML > $xmlPath
@@ -73,7 +79,7 @@ EndXML
 
 putXmlApiToOldJamf() {
     printf "$timeStamp %s\n" "Attempting to mark $macSerial Unmanaged on $oldJamfUrl"
-    xmlPutResponse=$(curl -sk -u $oldApiUser:$oldApiPass $oldJamfUrl/JSSResource/computers/serialnumber/"${macSerial}"/subset/general -T $xmlPath -X PUT 2>/dev/null)
+    xmlPutResponse=$(curl -sk -u $oldApiUser:$oldApiPass $oldJamfUrl/JSSResource/computers/id/"${oldJssId}"/subset/general -T $xmlPath -X PUT 2>/dev/null)
     # echo ${xmlPutResponse}
 
     if [[ $xmlPutResponse == *"The server has not found anything matching the request URI"* ]]; then
@@ -98,6 +104,7 @@ if [ -n "$internalServiceHandler" ]; then
 	fi
 fi
 
+getOldJamfData
 printf "$timeStamp %s\n" "Marking $macSerial "unmanaged" in $oldJamfUrl"
 createXml
 putXmlApiToOldJamf
