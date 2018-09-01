@@ -57,10 +57,27 @@ macSerial=$( system_profiler SPHardwareDataType | grep Serial |  awk '{print $NF
 # FUNCTIONS
 # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # #
 
+checkForOldJamf(){
+if [ -n "$internalServiceHandler" ]; then
+	host -t SRV "$internalServiceHandler" > /dev/null
+	if [ $? -ne 0 ]; then
+		printf "$timeStamp %s\n" "Internal network not detected."
+		printf "$timeStamp %s\n" "Cannot access old Jamf Pro."
+		printf "$timeStamp %s\n" "Exiting."
+		exit 1
+	fi
+fi
+}
+
 getOldJamfData() {
 	computerRecordOldJamf=$( /usr/bin/curl -s -u ${oldApiUser}:${oldApiPass} ${oldJamfUrl}/JSSResource/computers/serialnumber/${macSerial}/subset/general 2>/dev/null)
 	oldJssId=$(echo $computerRecordOldJamf | /usr/bin/xpath "//computer/general/id/text()" 2>/dev/null)
 	oldRemoteManagement=$(echo $computerRecordOldJamf | /usr/bin/xpath "//computer/general/remote_management/managed/text()" 2>/dev/null)
+	if [[ "$oldRemoteManagement" == "false" ]]; then
+	    printf "$timeStamp %s\n" "$macSerial is already "unmanaged" in $oldJamfUrl."
+		printf "$timeStamp %s\n" "No action taken."
+		exit 0
+	fi
 }
 
 createXml() {
@@ -85,8 +102,16 @@ putXmlApiToOldJamf() {
     if [[ $xmlPutResponse == *"The server has not found anything matching the request URI"* ]]; then
 	    printf "$timeStamp %s\n" "$oldJamfUrl has no match for $macSerial. No action taken."
 		exit 0
+	elif [[ $xmlPutResponse == *"Error"* ]]; then
+		printf "$timeStamp %s\n" "An API error occurred."
+		printf "$timeStamp %s\n" "Exiting."
+		exit 2
+	elif [[ $xmlPutResponse == *"oldJssId"* ]]; then
+		printf "$timeStamp %s\n" "$macSerial is marked unmanaged in $oldJamfUrl"
 	else
-	  printf "$timeStamp %s\n" "$macSerial is now "unmanaged" in $oldJamfUrl"
+		printf "$timeStamp %s\n" "An unknown error occurred."
+		printf "$timeStamp %s\n" "Exiting."
+		exit 3
 	fi 
 }
 
@@ -94,16 +119,7 @@ putXmlApiToOldJamf() {
 # Main Application
 # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # #
 
-if [ -n "$internalServiceHandler" ]; then
-	host -t SRV "$internalServiceHandler" > /dev/null
-	if [ $? -ne 0 ]; then
-		printf "$timeStamp %s\n" "Internal network not detected."
-		printf "$timeStamp %s\n" "Cannot access old Jamf Pro."
-		printf "$timeStamp %s\n" "Exiting."
-		exit 1
-	fi
-fi
-
+checkForOldJamf
 getOldJamfData
 printf "$timeStamp %s\n" "Marking $macSerial "unmanaged" in $oldJamfUrl"
 createXml
