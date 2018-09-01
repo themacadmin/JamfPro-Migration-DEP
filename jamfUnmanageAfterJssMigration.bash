@@ -74,7 +74,7 @@ getOldJamfData() {
 	oldJssId=$(echo $computerRecordOldJamf | /usr/bin/xpath "//computer/general/id/text()" 2>/dev/null)
 	oldRemoteManagement=$(echo $computerRecordOldJamf | /usr/bin/xpath "//computer/general/remote_management/managed/text()" 2>/dev/null)
 	if [[ "$oldRemoteManagement" == "false" ]]; then
-	    printf "$timeStamp %s\n" "$macSerial is already "unmanaged" in $oldJamfUrl."
+		printf "$timeStamp %s\n" "$macSerial is already "unmanaged" in $oldJamfUrl."
 		printf "$timeStamp %s\n" "No action taken."
 		exit 0
 	fi
