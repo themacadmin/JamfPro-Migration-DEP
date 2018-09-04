@@ -36,6 +36,7 @@ reset
 	# Full URL and credentials to the Old JSS. 
 		oldApiUser=""
 		oldApiPass=""
+	# Credentials require Update privileges on Computer and User objects.
 		
 internalServiceHandler=""		# SRV record address to validate that computer is on internal network (optional, required if org's old Jamf Pro instance is not Internet-facing.)
 
